@@ -18,6 +18,26 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 ###############################################################################
+"""IBBroker — Backtrader broker implementation for Interactive Brokers.
+
+This module contains three public classes:
+
+``IBOrder``
+    A dual-inheritance class that simultaneously satisfies Backtrader's
+    ``OrderBase`` interface and ``ib_insync``'s ``order.Order`` structure.
+    It translates Backtrader order parameters (exec type, price, TIF, …) into
+    the fields that ib_insync expects to send to TWS.
+
+``IBCommInfo``
+    A minimal ``CommInfoBase`` subclass used to attach commission information
+    to orders so that Backtrader's internal trade accounting keeps working.
+    Actual commissions are reported by IB and are not recalculated here.
+
+``IBBroker``
+    Implements ``BrokerBase``.  Delegates connection management to the shared
+    ``IBStore`` singleton and polls ``ib_insync`` trade objects on every
+    Cerebro ``next()`` tick to drive the Backtrader order state machine.
+"""
 from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
@@ -27,10 +47,6 @@ from datetime import date, datetime, timedelta
 import threading
 import uuid
 
-# import ib.ext.Order
-# import ib.opt as ibopt
-
-#from ib_insync import *
 import ib_insync
 
 from backtrader.feed import DataBase
@@ -45,58 +61,31 @@ from backtrader.comminfo import CommInfoBase
 
 from .ibstore import IBStore
 
-#bytes = bstr  # py2/3 need for ibpy
-
-
-# class IBOrderState(object):
-#     # wraps OrderState object and can print it
-#     _fields = ['status', 'initMargin', 'maintMargin', 'equityWithLoan',
-#                'commission', 'minCommission', 'maxCommission',
-#                'commissionCurrency', 'warningText']
-
-#     def __init__(self, orderstate):
-#         for f in self._fields:
-#             fname = 'm_' + f
-#             setattr(self, fname, getattr(orderstate, fname))
-
-#     def __str__(self):
-#         txt = list()
-#         txt.append('--- ORDERSTATE BEGIN')
-#         for f in self._fields:
-#             fname = 'm_' + f
-#             txt.append('{}: {}'.format(f.capitalize(), getattr(self, fname)))
-#         txt.append('--- ORDERSTATE END')
-#         return '\n'.join(txt)
-
 
 class IBOrder(OrderBase, ib_insync.order.Order):
-    '''Subclasses the IBPy order to provide the minimum extra functionality
-    needed to be compatible with the internally defined orders
+    '''Dual-base order class that bridges Backtrader and ib_insync.
 
-    Once ``OrderBase`` has processed the parameters, the __init__ method takes
-    over to use the parameter values and set the appropriate values in the
-    ib.ext.Order.Order object
+    Inherits from both ``backtrader.OrderBase`` (which carries the strategy
+    ref, size, price, exec type, validity, etc.) and from
+    ``ib_insync.order.Order`` (which carries the IB-specific fields TWS needs:
+    ``orderType``, ``lmtPrice``, ``auxPrice``, ``tif``, etc.).
 
-    Any extra parameters supplied with kwargs are applied directly to the
-    ib.ext.Order.Order object, which could be used as follows::
+    ``OrderBase.__init__`` runs first via ``super()`` and populates all
+    Backtrader-side attributes.  The body of ``__init__`` then maps those
+    attributes onto the corresponding IB fields.
 
-      Example: if the 4 order execution types directly supported by
-      ``backtrader`` are not enough, in the case of for example
-      *Interactive Brokers* the following could be passed as *kwargs*::
+    Extra IB-only parameters (e.g. ``orderType='LIT'``) can be passed as
+    **kwargs and are applied directly to the IB order object::
 
-        orderType='LIT', lmtPrice=10.0, auxPrice=9.8
+        order = IBOrder('BUY', orderType='LIT', lmtPrice=10.0, auxPrice=9.8)
 
-      This would override the settings created by ``backtrader`` and
-      generate a ``LIMIT IF TOUCHED`` order with a *touched* price of 9.8
-      and a *limit* price of 10.0.
-
-    This would be done almost always from the ``Buy`` and ``Sell`` methods of
-    the ``Strategy`` subclass being used in ``Cerebro``
+    This produces a *Limit If Touched* order regardless of the Backtrader
+    exec-type mapping — useful for IB order types not natively supported by
+    Backtrader.
     '''
 
     def __str__(self):
-        '''Get the printout from the base class and add some ib.Order specific
-        fields'''
+        '''Return a human-readable summary combining Backtrader and IB fields.'''
         basetxt = super(IBOrder, self).__str__()
         tojoin = [basetxt]
         tojoin.append('Ref: {}'.format(self.ref))
@@ -110,242 +99,388 @@ class IBOrder(OrderBase, ib_insync.order.Order):
         tojoin.append('GoodTillDate: {}'.format(self.goodTillDate))
         return '\n'.join(tojoin)
 
-    # Map backtrader order types to the ib specifics
+    # Mapping from Backtrader execution-type constants to IB order type strings.
+    # None (unspecified) defaults to a plain market order.
     _IBOrdTypes = {
-        None: 'MKT',  # default
-        Order.Market: 'MKT',
-        Order.Limit:'LMT',
-        Order.Close:'MOC',
-        Order.Stop: 'STP',
-        Order.StopLimit: 'STPLMT',
-        Order.StopTrail: 'TRAIL',
-        Order.StopTrailLimit: 'TRAIL LIMIT',
+        None: 'MKT',              # default — plain market order
+        Order.Market: 'MKT',      # market order
+        Order.Limit: 'LMT',       # limit order
+        Order.Close: 'MOC',       # market-on-close
+        Order.Stop: 'STP',        # stop order (becomes market when triggered)
+        Order.StopLimit: 'STPLMT',        # stop-limit order
+        Order.StopTrail: 'TRAIL',         # trailing stop
+        Order.StopTrailLimit: 'TRAIL LIMIT',  # trailing stop-limit
     }
 
     def __init__(self, action, **kwargs):
+        '''Initialise the order, map Backtrader fields to IB fields.
 
-        # Marker to indicate an openOrder has been seen with
-        # PendinCancel/Cancelled which is indication of an upcoming
-        # cancellation
+        Args:
+            action (str): ``'BUY'`` or ``'SELL'``.
+            **kwargs: Passed through to ``OrderBase`` (e.g. ``size``,
+                ``price``, ``pricelimit``, ``exectype``, ``valid``,
+                ``tradeid``, ``clientId``, ``orderId``) and any extra
+                IB-specific attributes applied directly to the order object.
+        '''
+        # Flag set to True when an openOrder with PendingCancel/Cancelled is
+        # received — this signals an order expiry rather than a user cancel.
         self._willexpire = False
 
+        # Tell OrderBase whether this is a buy or sell so it sets ordtype.
         self.ordtype = self.Buy if action == 'BUY' else self.Sell
 
+        # Let OrderBase process size, price, exectype, valid, etc.
         super(IBOrder, self).__init__()
-        ib_insync.order.Order.__init__(self)  # Invoke 2nd base class
+        # Initialise the ib_insync Order fields to their defaults.
+        ib_insync.order.Order.__init__(self)
 
-        # Now fill in the specific IB parameters
+        # --- Map execution type to IB order type string ---
         self.orderType = self._IBOrdTypes[self.exectype]
-        
-        self.permid = 0
 
-        # 'B' or 'S' should be enough
+        self.permid = 0  # IB permanent order ID (assigned by TWS after submission)
+
+        # IB uses 'BUY' / 'SELL' strings, not integers.
         self.action = action
 
-        # Set the prices
+        # Price fields: lmtPrice is the limit price; auxPrice is the stop /
+        # trail-amount price.  Both default to 0.0 (unused).
         self.lmtPrice = 0.0
         self.auxPrice = 0.0
 
-        if self.exectype == self.Market:  # is it really needed for Market?
+        if self.exectype == self.Market:
+            # Market order: no prices needed.
             pass
-        elif self.exectype == self.Close:  # is it ireally needed for Close?
+        elif self.exectype == self.Close:
+            # Market-on-Close: no explicit price.
             pass
         elif self.exectype == self.Limit:
+            # Limit order: execute at lmtPrice or better.
             self.lmtPrice = self.price
         elif self.exectype == self.Stop:
-            self.auxPrice = self.price  # stop price / exec is market
+            # Stop order: triggers a market order when auxPrice is touched.
+            self.auxPrice = self.price  # stop trigger price
         elif self.exectype == self.StopLimit:
-            self.lmtPrice = self.pricelimit  # req limit execution
-            self.auxPrice = self.price  # trigger price
+            # Stop-Limit: triggers a limit order at lmtPrice when auxPrice is
+            # touched.  auxPrice = stop trigger; lmtPrice = limit after trigger.
+            self.lmtPrice = self.pricelimit   # limit price after trigger
+            self.auxPrice = self.price        # stop trigger price
         elif self.exectype == self.StopTrail:
+            # Trailing stop: trail by a fixed amount or percentage.
             if self.trailamount is not None:
-                self.auxPrice = self.trailamount
+                self.auxPrice = self.trailamount       # fixed dollar trail
             elif self.trailpercent is not None:
-                # value expected in % format ... multiply 100.0
+                # IB expects trailingPercent in percentage points (e.g. 2.0
+                # for 2 %), but Backtrader uses a fraction (e.g. 0.02).
                 self.trailingPercent = self.trailpercent * 100.0
         elif self.exectype == self.StopTrailLimit:
+            # Trailing stop-limit: combines a trailing stop with a limit price.
             self.trailStopPrice = self.lmtPrice = self.price
-            # The limit offset is set relative to the price difference in TWS
+            # The limit offset is expressed relative to the trail stop price.
             self.lmtPrice = self.pricelimit
             if self.trailamount is not None:
                 self.auxPrice = self.trailamount
             elif self.trailpercent is not None:
-                # value expected in % format ... multiply 100.0
                 self.trailingPercent = self.trailpercent * 100.0
 
-        self.totalQuantity = abs(self.size)  # ib takes only positives
+        # IB requires a positive quantity; direction is encoded in ``action``.
+        self.totalQuantity = abs(self.size)
 
-        self.transmit = self.transmit
+        self.transmit = self.transmit  # whether to transmit immediately to TWS
         if self.parent is not None:
+            # Bracket / attached orders reference their parent by IB order ID.
             self.parentId = self.parent.orderId
 
-        # Time In Force: DAY, GTC, IOC, GTD
+        # --- Time-In-Force ---
+        # Backtrader ``valid`` field can be:
+        #   None          → GTC  (Good Till Cancelled — IB default)
+        #   datetime/date → GTD  (Good Till Date)
+        #   timedelta     → DAY if equal to Order.DAY, else GTD
+        #   0             → DAY
+        #   numeric       → GTD  (Backtrader date number)
         if self.valid is None:
-            tif = 'GTC'  # Good til cancelled
+            tif = 'GTC'  # no expiry specified — good till cancelled
         elif isinstance(self.valid, (datetime, date)):
-            tif = 'GTD'  # Good til date
+            tif = 'GTD'
             self.m_goodTillDate = self.valid.strftime('%Y%m%d %H:%M:%S')
         elif isinstance(self.valid, (timedelta,)):
             if self.valid == self.DAY:
                 tif = 'DAY'
             else:
-                tif = 'GTD'  # Good til date
-                valid = datetime.now() + self.valid  # .now, using localtime
+                tif = 'GTD'
+                valid = datetime.now() + self.valid
                 self.goodTillDate = valid.strftime('%Y%m%d %H:%M:%S')
-
         elif self.valid == 0:
             tif = 'DAY'
         else:
-            tif = 'GTD'  # Good til date
+            tif = 'GTD'
             valid = num2date(self.valid)
             self.goodTillDate = valid.strftime('%Y%m%d %H:%M:%S')
 
         self.tif = tif
 
-        # OCA
-        self.ocaType = 1  # Cancel all remaining orders with block
+        # OCA (One-Cancels-All) type 1: cancel all remaining orders in the
+        # group when one is filled.  The actual ocaGroup UUID is assigned by
+        # IBBroker.submit().
+        self.ocaType = 1
 
-        # pass any custom arguments to the order
+        # Apply any extra IB-specific kwargs directly to the order object.
+        # If the attribute already exists on ib_insync.Order, use it directly;
+        # otherwise fall back to the legacy 'm_' prefixed name.
         for k in kwargs:
             setattr(self, (not hasattr(self, k)) * 'm_' + k, kwargs[k])
 
 
 class IBCommInfo(CommInfoBase):
+    '''Minimal commission-info object for IB orders.
+
+    IB calculates actual commissions server-side and reports them back after
+    execution.  Backtrader's ``Strategy`` and ``Trade`` objects still need a
+    ``CommInfo`` attached to each order so that the internal accounting
+    (``getvalue``, ``getoperationcost``) can run without crashing.
+
+    Both methods here return a simple ``abs(size) * price`` approximation.
+    The values are close enough for P&L tracking purposes, even though the
+    real IB commission structure is more complex (per-share tiered, minimum
+    fees, etc.).
+
+    Note: margin is not pre-calculated here (it would require an
+    ``OrderState`` round-trip).  ``getvaluesize`` approximates it as full
+    notional value.
     '''
-    Commissions are calculated by ib, but the trades calculations in the
-    ```Strategy`` rely on the order carrying a CommInfo object attached for the
-    calculation of the operation cost and value.
-
-    These are non-critical informations, but removing them from the trade could
-    break existing usage and it is better to provide a CommInfo objet which
-    enables those calculations even if with approvimate values.
-
-    The margin calculation is not a known in advance information with IB
-    (margin impact can be gotten from OrderState objects) and therefore it is
-    left as future exercise to get it'''
 
     def getvaluesize(self, size, price):
-        # In real life the margin approaches the price
+        '''Return the notional value of a position (size * price).
+
+        Used by Backtrader to estimate margin/value.  For IB, margin is
+        determined server-side, so this is an approximation.
+        '''
         return abs(size) * price
 
     def getoperationcost(self, size, price):
-        '''Returns the needed amount of cash an operation would cost'''
-        # Same reasoning as above
+        '''Return the cash cost of opening/closing a position.
+
+        Returns:
+            float: ``abs(size) * price`` — the gross value of the trade,
+            ignoring commissions (which are added by IB separately).
+        '''
         return abs(size) * price
 
 
 class MetaIBBroker(BrokerBase.__class__):
+    '''Metaclass that auto-registers ``IBBroker`` with ``IBStore``.
+
+    When Python finishes creating the ``IBBroker`` class body, this metaclass
+    fires and stores a reference to ``IBBroker`` in ``IBStore.BrokerCls``.
+    This allows ``IBStore.getbroker()`` to instantiate the broker without a
+    hard import dependency between the two modules.
+    '''
     def __init__(cls, name, bases, dct):
-        '''Class has already been created ... register'''
-        # Initialize the class
+        '''Register the newly created broker class with the store.'''
         super(MetaIBBroker, cls).__init__(name, bases, dct)
         IBStore.BrokerCls = cls
 
 
 class IBBroker(with_metaclass(MetaIBBroker, BrokerBase)):
-    '''Broker implementation for Interactive Brokers.
+    '''Backtrader ``BrokerBase`` implementation for Interactive Brokers.
 
-    This class maps the orders/positions from Interactive Brokers to the
-    internal API of ``backtrader``.
+    Responsibilities
+    ----------------
+    * Delegates the IB connection to the ``IBStore`` singleton.
+    * Translates ``buy()`` / ``sell()`` calls into ``IBOrder`` objects and
+      submits them via ``IBStore.placeOrder()``.
+    * On every Cerebro ``next()`` cycle, polls ``ib_insync`` trade objects to
+      drive order status transitions: Submitted → Accepted → Completed /
+      Cancelled / Rejected.
+    * Reports cash and portfolio value from the IB account.
 
-    Notes:
-
-      - ``tradeid`` is not really supported, because the profit and loss are
-        taken directly from IB. Because (as expected) calculates it in FIFO
-        manner, the pnl is not accurate for the tradeid.
-
-      - Position
-
-        If there is an open position for an asset at the beginning of
-        operaitons or orders given by other means change a position, the trades
-        calculated in the ``Strategy`` in cerebro will not reflect the reality.
-
-        To avoid this, this broker would have to do its own position
-        management which would also allow tradeid with multiple ids (profit and
-        loss would also be calculated locally), but could be considered to be
-        defeating the purpose of working with a live broker
+    Limitations
+    -----------
+    * ``tradeid`` is not accurately supported because P&L comes directly from
+      IB (FIFO basis) rather than being recalculated locally.
+    * Positions opened outside this session (e.g. from another client or a
+      manual trade) are not reflected in Backtrader's internal position
+      tracking until a ``reqPositions()`` update is received.
     '''
     params = ()
 
     def __init__(self, **kwargs):
+        '''Initialise the broker and connect to IBStore.
+
+        Args:
+            **kwargs: Forwarded to ``IBStore`` (``host``, ``port``,
+                ``clientId``, ``account``, etc.).  See ``IBStore`` params for
+                the full list.
+        '''
         super(IBBroker, self).__init__()
 
+        # Obtain (or create) the IBStore singleton with the given connection
+        # parameters.  All IBData feeds share this same store.
         self.ibstore = IBStore(**kwargs)
 
+        # Cash and portfolio value are fetched lazily from IB on each call to
+        # getcash() / getvalue().  Initialise to 0 until start() pulls the
+        # real figures.
         self.startingcash = self.cash = 0.0
         self.startingvalue = self.value = 0.0
 
-        #self._lock_orders = threading.Lock()  # control access
-        # self.orderbyid = dict()  # orders by order id
-        # self.executions = dict()  # notified executions
-        # self.ordstatus = collections.defaultdict(dict)
-        
+        # List of orders that have been submitted but not yet reached a
+        # terminal state (Filled / Cancelled / Rejected / Expired).
         self.open_orders = list()
-        self.notifs = queue.Queue()  # holds orders which are notified
-        self.tonotify = collections.deque()  # hold oids to be notified
+
+        # Queue of cloned order objects waiting to be consumed by Cerebro's
+        # notify_order() machinery.
+        self.notifs = queue.Queue()
+
+        # Deque of order IDs that need to be notified (used internally).
+        self.tonotify = collections.deque()
 
     def start(self):
+        '''Called by Cerebro when the run starts.
+
+        Registers this broker with the store, then fetches the initial account
+        cash and portfolio value so that Backtrader's starting balance is
+        correct from bar zero.
+        '''
         super(IBBroker, self).start()
-        
+
+        # Register the broker with the store so it can receive order updates.
         self.ibstore.start(broker=self)
 
+        # Temporarily zero out while we wait for the IB account data.
         self.startingcash = self.cash = 0.0
         self.startingvalue = self.value = 0.0
+
+        # Fetch managed accounts and current account values from TWS.
         self.ibstore.reqAccountUpdates()
-            
+
+        # Snapshot the initial cash and portfolio value.
         self.startingcash = self.cash = self.ibstore.get_acc_cash()
         self.startingvalue = self.value = self.ibstore.get_acc_value()
 
     def stop(self):
+        '''Called by Cerebro when the run finishes.  Disconnects from IB.'''
         super(IBBroker, self).stop()
         self.ibstore.stop()
 
     def getcash(self):
-        # This call cannot block if no answer is available from ib
+        '''Return the current total cash balance from IB.
+
+        Fetches a fresh value from the store on every call.  Non-blocking —
+        returns the last known value if no IB response is available yet.
+        '''
         self.cash = self.ibstore.get_acc_cash()
         return self.cash
 
     def getvalue(self, datas=None):
+        '''Return the current net liquidation value of the IB account.
+
+        Args:
+            datas: Ignored — IB reports portfolio-level value, not per-data.
+
+        Returns:
+            float: Net liquidation value (cash + open positions at market).
+        '''
         self.value = self.ibstore.get_acc_value()
         return self.value
 
     def getposition(self, data, clone=True):
+        '''Return the current position for the given data feed.
+
+        Looks up the position by the IB contract ID of the trading contract
+        associated with the data feed.
+
+        Args:
+            data: A Backtrader data feed whose ``tradecontract`` attribute
+                identifies the IB instrument.
+            clone (bool): Return a copy of the position (default ``True``).
+
+        Returns:
+            backtrader.Position: Current size and average price.
+        '''
         return self.ibstore.getposition(data.tradecontract, clone=clone)
 
     def cancel(self, order):
+        '''Cancel a live order.
+
+        Args:
+            order (IBOrder): The order to cancel.  Its ``orderId`` must match
+                a live order at TWS.
+        '''
         return self.ibstore.cancelOrder(order.orderId)
-        
+
     def orderstatus(self, order):
+        '''Return the current status string of an order.
+
+        Args:
+            order (IBOrder): The order to query.
+
+        Returns:
+            str: One of the IB status strings (e.g. ``'Submitted'``).
+        '''
         return order.status
 
     def submit(self, order):
+        '''Submit an order to IB and handle the immediate response.
+
+        Steps:
+        1. Mark the order as submitted in Backtrader.
+        2. Assign an OCA group UUID (or inherit from an ``oco`` order).
+        3. Place the order via ``IBStore.placeOrder()`` and wait for TWS to
+           acknowledge it.
+        4. If TWS reports the order as already filled, complete it immediately.
+           Otherwise, add it to ``open_orders`` for polling in ``next()``.
+
+        Args:
+            order (IBOrder): A fully constructed order ready to send.
+
+        Returns:
+            IBOrder: The same order object (status updated).
+        '''
         order.submit(self)
 
-        # ocoize if needed
-        if order.oco is None:  # Generate a UniqueId
+        # Assign OCA group: a fresh UUID for standalone orders, or inherit the
+        # group from the linked ``oco`` order so they cancel each other.
+        if order.oco is None:
             order.ocaGroup = uuid.uuid4()
         else:
             order.ocaGroup = self.orderbyid[order.oco.orderId].ocaGroup
-        
+
+        # Place the order and block until TWS confirms it has been received.
         trade = self.ibstore.placeOrder(order.orderId, order.data.tradecontract, order)
 
+        # Notify the strategy that the order has been submitted.
         self.notify(order)
-        
+
         if trade.orderStatus.status == self.FILLED:
+            # Order filled immediately (e.g. market order during open market).
             order.completed()
             self.notify(order)
         else:
+            # Order is live — track it for status updates.
             self.open_orders.append(order)
-            
+
         return order
 
     def getcommissioninfo(self, data):
+        '''Build an ``IBCommInfo`` object for the given data feed's contract.
+
+        The multiplier and stocklike flag drive Backtrader's internal value /
+        cost calculations.  For futures/options the contract multiplier
+        converts price to notional; for equities it is 1.
+
+        Args:
+            data: Backtrader data feed with a ``tradecontract`` attribute.
+
+        Returns:
+            IBCommInfo: Commission-info object attached to new orders.
+        '''
         contract = data.tradecontract
         try:
             mult = float(contract.multiplier)
         except (ValueError, TypeError):
-            mult = 1.0
+            mult = 1.0  # equities, forex — no multiplier
 
+        # stocklike=True disables margin-based position sizing in Backtrader.
         stocklike = contract.secType not in ('FUT', 'OPT', 'FOP',)
 
         return IBCommInfo(mult=mult, stocklike=stocklike)
@@ -354,7 +489,26 @@ class IBBroker(with_metaclass(MetaIBBroker, BrokerBase)):
                    size, price=None, plimit=None,
                    exectype=None, valid=None,
                    tradeid=0, **kwargs):
+        '''Create an ``IBOrder`` without submitting it.
 
+        Fetches the next available IB order ID from TWS and attaches
+        commission info before returning the order.
+
+        Args:
+            action (str): ``'BUY'`` or ``'SELL'``.
+            owner: The Backtrader strategy instance that owns this order.
+            data: The data feed the order is for.
+            size (float): Number of units to trade.
+            price (float, optional): Limit / stop price.
+            plimit (float, optional): Limit price for stop-limit orders.
+            exectype: Backtrader exec type constant (e.g. ``Order.Limit``).
+            valid: Expiry specification (see ``IBOrder.__init__``).
+            tradeid (int): Backtrader trade grouping ID (not used by IB).
+            **kwargs: Extra IB order fields passed through to ``IBOrder``.
+
+        Returns:
+            IBOrder: Constructed but not yet submitted order.
+        '''
         order = IBOrder(action, owner=owner, data=data,
                         size=size, price=price, pricelimit=plimit,
                         exectype=exectype, valid=valid,
@@ -370,11 +524,26 @@ class IBBroker(with_metaclass(MetaIBBroker, BrokerBase)):
             size, price=None, plimit=None,
             exectype=None, valid=None, tradeid=0,
             **kwargs):
+        '''Create and submit a buy order.
 
+        Args:
+            owner: The calling strategy.
+            data: Data feed identifying the instrument.
+            size (float): Number of units to buy.
+            price (float, optional): Order price (limit / stop level).
+            plimit (float, optional): Limit price for stop-limit orders.
+            exectype: Backtrader exec type (default ``Order.Market``).
+            valid: Order validity / TIF (see ``IBOrder.__init__``).
+            tradeid (int): Strategy-internal trade ID.
+            **kwargs: Extra IB order fields.
+
+        Returns:
+            IBOrder: Submitted buy order.
+        '''
         order = self._makeorder(
-                        'BUY',
-                        owner, data, size, price, plimit, exectype, valid, tradeid,
-                        **kwargs)
+            'BUY',
+            owner, data, size, price, plimit, exectype, valid, tradeid,
+            **kwargs)
 
         return self.submit(order)
 
@@ -382,18 +551,47 @@ class IBBroker(with_metaclass(MetaIBBroker, BrokerBase)):
              size, price=None, plimit=None,
              exectype=None, valid=None, tradeid=0,
              **kwargs):
+        '''Create and submit a sell order.
 
+        Args:
+            owner: The calling strategy.
+            data: Data feed identifying the instrument.
+            size (float): Number of units to sell.
+            price (float, optional): Order price (limit / stop level).
+            plimit (float, optional): Limit price for stop-limit orders.
+            exectype: Backtrader exec type (default ``Order.Market``).
+            valid: Order validity / TIF (see ``IBOrder.__init__``).
+            tradeid (int): Strategy-internal trade ID.
+            **kwargs: Extra IB order fields.
+
+        Returns:
+            IBOrder: Submitted sell order.
+        '''
         order = self._makeorder(
-                        'SELL',
-                        owner, data, size, price, plimit, exectype, valid, tradeid,
-                        **kwargs)
+            'SELL',
+            owner, data, size, price, plimit, exectype, valid, tradeid,
+            **kwargs)
 
         return self.submit(order)
 
     def notify(self, order):
+        '''Enqueue a clone of ``order`` for delivery to the strategy.
+
+        Backtrader's notification machinery calls ``get_notification()`` each
+        bar to drain this queue and call ``strategy.notify_order()``.
+
+        Args:
+            order (IBOrder): The order whose current state should be notified.
+        '''
         self.notifs.put(order.clone())
 
     def get_notification(self):
+        '''Dequeue and return the next pending order notification.
+
+        Returns:
+            IBOrder or None: The next cloned order, or ``None`` if the queue
+            is empty.
+        '''
         try:
             return self.notifs.get(False)
         except queue.Empty:
@@ -401,83 +599,127 @@ class IBBroker(with_metaclass(MetaIBBroker, BrokerBase)):
 
         return None
 
+    # IB trade status strings returned by ``trade.orderStatus.status``.
+    # Used as string constants throughout ``next()`` to avoid typos.
     (SUBMITTED, FILLED, CANCELLED, INACTIVE,
-             PENDINGSUBMIT, PENDINGCANCEL, PRESUBMITTED) = (
-                 'Submitted', 'Filled', 'Cancelled', 'Inactive',
-                 'PendingSubmit', 'PendingCancel', 'PreSubmitted',)
-                 
-    def next(self):
-        self.notifs.put(None)  # mark notificatino boundary
+     PENDINGSUBMIT, PENDINGCANCEL, PRESUBMITTED) = (
+         'Submitted', 'Filled', 'Cancelled', 'Inactive',
+         'PendingSubmit', 'PendingCancel', 'PreSubmitted',)
 
-        if len(self.open_orders) > 0:
-            trades = self.ibstore.reqTrades()
-            
-            for order in self.open_orders:
-                for trade in trades:
-                    if order.orderId == trade.order.orderId:
-            
-                        if trade.orderStatus.status == self.SUBMITTED \
-                            and trade.filled == 0:
-                            if order.status != order.Accepted:
-                                order.accept(self)
-                                self.notify(order)
-                
-                        elif trade.orderStatus.status == self.CANCELLED:
-                            # duplicate detection
-                            if order.status in [order.Cancelled, order.Expired]:
-                                pass
-                
-                            if order._willexpire:
-                                # An openOrder has been seen with PendingCancel/Cancelled
-                                # and this happens when an order expires
-                                order.expire()
-                            else:
-                                # Pure user cancellation happens without an openOrder
-                                order.cancel()
-                            self.open_orders.remove(order)
-                            self.notify(order)
-                
-                        elif trade.orderStatus.status == self.PENDINGCANCEL:
-                            # In theory this message should not be seen according to the docs,
-                            # but other messages like PENDINGSUBMIT which are similarly
-                            # described in the docs have been received in the demo
-                            if order.status == order.Cancelled:  # duplicate detection
-                                pass
-                            else:
-                                # Pure user cancellation happens without an openOrder
-                                order.cancel()
-                            self.open_orders.remove(order)
-                            self.notify(order)                
-                            # We do nothing because the situation is handled with the 202 error
-                            # code if no orderStatus with CANCELLED is seen
-                            # order.cancel()
-                            # self.notify(order)
-                
-                        elif trade.orderStatus.status == self.INACTIVE:
-                            # This is a tricky one, because the instances seen have led to
-                            # order rejection in the demo, but according to the docs there may
-                            # be a number of reasons and it seems like it could be reactivated
-                            if order.status == order.Rejected:  # duplicate detection
-                                pass
-                            order.reject(self)
-                            self.open_orders.remove(order)
-                            self.notify(order)
-                
-                        elif trade.orderStatus.status in [self.SUBMITTED, self.FILLED]:
-                            # These two are kept inside the order until execdetails and
-                            # commission are all in place - commission is the last to come
-                            order.completed()
-                            self.open_orders.remove(order)
-                            self.notify(order)                 
-                
-                        elif trade.orderStatus.status in [self.PENDINGSUBMIT, self.PRESUBMITTED]:
-                            # According to the docs, these statuses can only be set by the
-                            # programmer but the demo account sent it back at random times with
-                            # "filled"
-                            self.notify(order)
-                        else:  # Unknown status ...
-                            pass
+    def next(self):
+        '''Poll open orders and drive the Backtrader order state machine.
+
+        Called by Cerebro once per bar.  Fetches the current trade list from
+        IB and matches each ``open_order`` against a live ``ib_insync.Trade``
+        by ``orderId``.  Transitions the Backtrader order through the
+        following states based on the IB trade status:
+
+        +-----------------+--------------------------------------------------+
+        | IB status       | Backtrader action                                |
+        +=================+==================================================+
+        | Submitted (0    | ``order.accept()`` — order acknowledged by TWS   |
+        | fills so far)   | but not yet matched                              |
+        +-----------------+--------------------------------------------------+
+        | Cancelled       | ``order.expire()`` if ``_willexpire`` is set     |
+        |                 | (GTD/DAY expiry), otherwise ``order.cancel()``   |
+        +-----------------+--------------------------------------------------+
+        | PendingCancel   | ``order.cancel()`` — cancellation in progress    |
+        +-----------------+--------------------------------------------------+
+        | Inactive        | ``order.reject()`` — typically a margin / config |
+        |                 | rejection from TWS                               |
+        +-----------------+--------------------------------------------------+
+        | Submitted or    | ``order.completed()`` — fully filled             |
+        | Filled (non-0   |                                                  |
+        | fills)          |                                                  |
+        +-----------------+--------------------------------------------------+
+        | PendingSubmit,  | ``notify()`` only — no state change yet          |
+        | PreSubmitted    |                                                  |
+        +-----------------+--------------------------------------------------+
+
+        A ``None`` sentinel is pushed onto ``self.notifs`` at the start to
+        mark the boundary of this bar's notifications.
+        '''
+        # Push a None boundary marker so Cerebro knows which notifications
+        # belong to this bar vs the next.
+        self.notifs.put(None)
+
+        if len(self.open_orders) == 0:
+            return  # nothing to do
+
+        # Fetch the current live trades list from TWS (one round-trip).
+        trades = self.ibstore.reqTrades()
+
+        for order in self.open_orders:
+            for trade in trades:
+                if order.orderId != trade.order.orderId:
+                    continue  # not this order
+
+                status = trade.orderStatus.status
+
+                if status == self.SUBMITTED and trade.filled == 0:
+                    # TWS has acknowledged the order but no fill has arrived.
+                    if order.status != order.Accepted:
+                        order.accept(self)
+                        self.notify(order)
+
+                elif status == self.CANCELLED:
+                    # Duplicate-detection: skip if already in a terminal state.
+                    if order.status in [order.Cancelled, order.Expired]:
+                        pass
+                    elif order._willexpire:
+                        # An openOrder with PendingCancel/Cancelled was seen
+                        # earlier, indicating a GTD/DAY time-based expiry.
+                        order.expire()
+                    else:
+                        # Direct user cancellation (no prior openOrder signal).
+                        order.cancel()
+                    self.open_orders.remove(order)
+                    self.notify(order)
+
+                elif status == self.PENDINGCANCEL:
+                    # Documented as an internal-only status but seen in practice.
+                    if order.status == order.Cancelled:
+                        pass  # already handled
+                    else:
+                        order.cancel()
+                    self.open_orders.remove(order)
+                    self.notify(order)
+
+                elif status == self.INACTIVE:
+                    # Usually means the order was rejected (e.g. insufficient
+                    # margin).  According to the IB docs it can also mean the
+                    # order is temporarily inactive and may be reactivated, but
+                    # treating it as a rejection is the safe default.
+                    if order.status == order.Rejected:
+                        pass  # duplicate
+                    order.reject(self)
+                    self.open_orders.remove(order)
+                    self.notify(order)
+
+                elif status in [self.SUBMITTED, self.FILLED]:
+                    # A non-zero fill count with Submitted or a full Fill
+                    # status means the order is done.
+                    order.completed()
+                    self.open_orders.remove(order)
+                    self.notify(order)
+
+                elif status in [self.PENDINGSUBMIT, self.PRESUBMITTED]:
+                    # Transient states — just notify so the strategy can log
+                    # them.  No state transition yet.
+                    self.notify(order)
+
+                else:
+                    # Unknown / unexpected status — do nothing.
+                    pass
         return
+
+    # ---------------------------------------------------------------------------
+    # The methods below (push_execution, push_commissionreport, push_portupdate,
+    # push_ordererror, push_orderstate) are commented out.  They represent the
+    # callback-based approach used by the original ibpy library.  With ib_insync
+    # the equivalent logic is handled by polling ib.trades() in next() above.
+    # They are retained as a reference for future implementation.
+    # ---------------------------------------------------------------------------
 
     # def push_execution(self, ex):
     #     self.executions[ex.m_execId] = ex
