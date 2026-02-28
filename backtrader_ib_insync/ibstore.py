@@ -264,14 +264,21 @@ class IBStore(with_metaclass(MetaSingleton, object)):
         util.startLoop()
         
         self.ib = IB()
-        
-        self.ib.connect(
-                    host=self.p.host, port=self.p.port, 
+
+        # In Python 3.14, asyncio.timeout() requires running inside a Task.
+        # Wrapping connectAsync in ensure_future creates a proper Task context.
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(
+            asyncio.ensure_future(
+                self.ib.connectAsync(
+                    host=self.p.host, port=self.p.port,
                     clientId=self.clientId,
                     timeout=self.timeout,
                     readonly=self.readonly,
                     account=self.account,
-                    )
+                )
+            )
+        )
         
         # This utility key function transforms a barsize into a:
         #   (Timeframe, Compression) tuple which can be sorted
