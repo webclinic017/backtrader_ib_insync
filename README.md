@@ -2,8 +2,6 @@
 
 A Python library that integrates [Interactive Brokers](https://www.interactivebrokers.com/) with the [Backtrader](https://www.backtrader.com/) algorithmic trading framework using the modern [`ib_insync`](https://github.com/erdewit/ib_insync) async API.
 
-**Status:** Alpha — functional but not production-hardened.
-
 ---
 
 ## Features
